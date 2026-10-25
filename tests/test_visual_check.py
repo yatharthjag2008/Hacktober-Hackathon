@@ -5,15 +5,12 @@ import sys
 import unittest
 from pathlib import Path
 
-from support import HarnessTest, tool_call
+from support import MAIN_GD, HarnessTest, box_game, tool_call
 
 HAVE_DISPLAY = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 requires_display = unittest.skipUnless(
     HAVE_DISPLAY, "Visual Check needs a display: set DISPLAY or WAYLAND_DISPLAY (or run with a virtual one)")
 
-DESIGN = "# Box\n\nPitch: a red box on screen.\n"
-MAIN_GD = ("extends Node2D\n\nfunc _draw() -> void:\n"
-           "\tdraw_rect(Rect2(100, 100, 200, 200), Color.RED)\n")
 PNG_PREFIX = "data:image/png;base64,"
 
 
@@ -24,18 +21,15 @@ def image_urls(request):
             for part in m["content"] if part.get("type") == "image_url"]
 
 
-def build_box():
-    return [
-        tool_call("create_game", name="box", title="Box", design=DESIGN),
-        tool_call("write_file", path="main.gd", content=MAIN_GD),
-        tool_call("run_game"),
-    ]
+def checked_box_game(*steps):
+    """Script: create the box game, write its main.gd, Run Check it, then `steps`."""
+    return box_game(tool_call("write_file", path="main.gd", content=MAIN_GD), tool_call("run_game"), *steps)
 
 
 @requires_display
 class VisualCheckOn(HarnessTest):
     def test_clean_run_check_sends_screenshots_to_the_model(self):
-        r = self.run_harness([*build_box(), tool_call("finish", summary="A red box.")],
+        r = self.run_harness(checked_box_game(tool_call("finish", summary="A red box.")),
                              ["make a box game"], "--no-grill", visual=True)
 
         # Request index 3 is the one sent after run_game's result.
@@ -50,8 +44,7 @@ class VisualCheckOn(HarnessTest):
 
     def test_old_screenshots_are_compacted_out_of_later_requests(self):
         # Four more tool steps push the screenshot message out of the recent window.
-        r = self.run_harness([*build_box(), *[tool_call("list_files")] * 4,
-                              tool_call("finish", summary="A red box.")],
+        r = self.run_harness(checked_box_game(*[tool_call("list_files")] * 4, tool_call("finish", summary="A red box.")),
                              ["make a box game"], "--no-grill", visual=True)
 
         self.assertEqual(len(r.requests), 8, r.stdout)
@@ -63,7 +56,7 @@ class VisualCheckOn(HarnessTest):
 
 class VisualCheckOff(HarnessTest):
     def test_no_visual_never_sends_images(self):
-        r = self.run_harness([*build_box(), tool_call("finish", summary="A red box.")],
+        r = self.run_harness(checked_box_game(tool_call("finish", summary="A red box.")),
                              ["make a box game"], "--no-grill", visual=False)
 
         self.assertEqual(len(r.requests), 4)
@@ -80,7 +73,3 @@ class NoDisplay(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("skipped=2", p.stderr)
         self.assertIn("needs a display", p.stderr)
-
-
-if __name__ == "__main__":
-    unittest.main()

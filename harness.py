@@ -11,6 +11,7 @@ No dependencies beyond the Python standard library.
 """
 import argparse
 import base64
+import http.client
 import json
 import os
 import re
@@ -222,9 +223,17 @@ class Project:
         self.clean_since_last_edit = False
         self.pending_shots: list[Path] = []
 
+    def _inside(self, p: Path) -> bool:
+        return p == self.path or self.path in p.parents
+
     def _resolve(self, rel: str) -> Path:
-        p = (self.path / rel.removeprefix("res://")).resolve()  # an absolute path replaces self.path
-        if self.path not in p.parents and p != self.path:
+        """Map a model-given path into the game folder. "/x" means the game's x, like "res://x",
+        unless it already points inside the game folder. ".." may never leave the folder."""
+        p = Path(rel.removeprefix("res://"))
+        if p.is_absolute() and not self._inside(p.resolve()):
+            p = p.relative_to(p.anchor)
+        p = (self.path / p).resolve()
+        if not self._inside(p):
             raise ValueError(f"path escapes project: {rel}")
         return p
 
@@ -317,15 +326,15 @@ class Project:
 
 
 def create_project(cfg, name, title, design):
-    out = cfg.out / slugify(name)
-    if out.exists():
-        raise ValueError(f"a game named {out.name} already exists; pick another name or open_game it")
-    shutil.copytree(TEMPLATE, out)
-    (out / "design.md").write_text(design.strip() + "\n")
-    pg = out / "project.godot"
+    game_dir = cfg.out / slugify(name)
+    if game_dir.exists():
+        raise ValueError(f"a game named {game_dir.name} already exists; pick another name or open_game it")
+    shutil.copytree(TEMPLATE, game_dir)
+    (game_dir / "design.md").write_text(design.strip() + "\n")
+    pg = game_dir / "project.godot"
     pg.write_text(pg.read_text().replace('config/name="Generated Game"',
                                          f'config/name="{title[:60].replace(chr(34), "")}"'))
-    return Project(out, cfg)
+    return Project(game_dir, cfg)
 
 
 # --- model client ---------------------------------------------------------
@@ -434,7 +443,7 @@ class Session:
             print(f"{C['dim']}  thinking…{C['reset']}", end="\r", flush=True)
             try:
                 msg = chat(self.cfg, self.messages, TOOLS)
-            except (urllib.error.URLError, TimeoutError) as e:
+            except (OSError, http.client.HTTPException) as e:  # HTTP errors, timeouts, refused or dropped connections
                 detail = e.read().decode()[:300] if isinstance(e, urllib.error.HTTPError) else str(e)
                 say("red", "MODEL ERROR", detail)
                 self.trace.log("model_error", detail=detail)
@@ -594,7 +603,7 @@ def main():
     ap.add_argument("--out-dir", dest="out", type=Path, default=os.environ.get("HARNESS_OUT_DIR", DEFAULT_OUT),
                     help="Where games and Session traces are written (default: out/)")
     cfg = ap.parse_args()
-    cfg.out = Path(cfg.out).resolve()
+    cfg.out = cfg.out.resolve()
 
     session = Session(cfg)
     if cfg.open:
