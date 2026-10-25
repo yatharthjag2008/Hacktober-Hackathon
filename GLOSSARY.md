@@ -31,3 +31,7 @@ _Avoid_: ticket, issue, prompt
 **Visual Check**
 After a clean Run Check, screenshots of the game actually rendering are shown to the model, which compares them with the Design Proposal and fixes what looks wrong.
 _Avoid_: screenshot test
+
+**Session**
+One continuous conversation between a Player-Creator and the Harness. It can span Design Interviews, builds and Change Requests across several games.
+_Avoid_: chat, run

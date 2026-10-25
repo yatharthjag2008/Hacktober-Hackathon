@@ -31,7 +31,7 @@ Godot 4 games: 2D or 3D, any genre. It is built to run on open-weight models.
 | 👀 **Visual Check** | Renders the game for real and shows screenshots to the model, which compares them with the design and fixes black screens, bad cameras or missing HUD. |
 | 🔁 **Change Requests** | Once the game is built, keep talking: add features, change things, or report bugs you found while playing. |
 | 🔌 **Any model** | One OpenAI-compatible client works with Ollama, vLLM, LM Studio, OpenRouter and others. Defaults to an open-weight model via Ollama. |
-| 📜 **Full trace** | Every model step, tool call and check is shown live and saved to `.harness/trace.jsonl`. |
+| 📜 **Full trace** | Every model step, tool call and check is shown live and saved to `out/.sessions/`. |
 
 ## 🚀 Quick start
 
@@ -46,28 +46,47 @@ mkdir -p tools && curl -L -o /tmp/godot.zip \
 # 2. An open-weight model via Ollama
 ollama pull gemma4:31b-cloud
 
-# 3. Make a game
-python3 harness.py new "a 3D ball-rolling coin collector with a 60 second timer" --grill
+# 3. Start talking
+python3 harness.py
 ```
 
 ## 🕹️ Usage
 
-```bash
-python3 harness.py new  "<game brief>" [--grill] [--name my-game]   # design → build → iterate
-python3 harness.py edit my-game                                       # come back and keep iterating
-python3 harness.py play my-game                                       # launch it in a window
+`python3 harness.py` starts a conversation. Describe a game and OpenGames interviews you about the
+design, shows you a Design Proposal, and builds it once you accept. Then keep talking: ask for
+features, report bugs you found while playing, or switch to another game.
+
+```
+› a 3D marble maze with a timer
+  Q1 - Camera: tilt the maze (Monkey Ball style) or roll the marble directly?
+    Recommended: tilt the maze with WASD
+  ...
+› yes
+  # Marble Maze ...  Accept this design?
+› yes
+  TOOL create_game · write_file · RUN CHECK ✓ · VISUAL CHECK · FINISHED
+marble-maze › the marble is too fast, and add a second level
 ```
 
-While iterating, anything you type is a **Change Request**. Commands:
+```bash
+python3 harness.py                         # start a conversation
+python3 harness.py "a pong game"           # start with a first message
+python3 harness.py --open marble-maze      # pick up where you left off
+```
 
 | Command | |
 |---|---|
-| `/play` | Launch the game in a window |
-| `/files` | List project files |
-| `/help` | Show help |
-| `/quit` | Exit; continue later with `edit` |
+| `/games` | List games in `out/` |
+| `/open <name>` | Switch to a game |
+| `/play` | Launch the open game in a window |
+| `/files` | List the open game's files |
+| `/grill on\|off` | Turn the Design Interview on or off (or just say "just build it") |
+| `/model <name>` | Switch model mid-conversation |
+| `/new` | Start a fresh conversation |
+| `/quit` | Exit |
 
 Games are written to `out/<name>/`. Open `project.godot` in the Godot editor to inspect them or export them.
+Every session is logged to `out/.sessions/<timestamp>.jsonl`.
 
 ### Options
 
@@ -77,10 +96,11 @@ Games are written to `out/<name>/`. Open `project.godot` in the Godot editor to 
 | `--base-url` | `http://localhost:11434/v1` | Any OpenAI-compatible endpoint |
 | `--api-key` | `ollama` | API key for hosted endpoints |
 | `--godot` | `tools/godot` | Path to the Godot 4 binary |
+| `--open` | | Start with an existing game open |
+| `--no-grill` | | Skip the Design Interview |
 | `--no-visual` | | Skip the Visual Check (for no display, or a text-only model) |
 | `--frames` | `1800` | Frames at 60 fps per Run Check |
-| `--max-steps` | `40` | Agent steps per task |
-| `--no-interactive` | | Exit after building (`new` only) |
+| `--max-steps` | `40` | Agent steps per message |
 
 All of these can also be set with the environment variables `HARNESS_MODEL`, `HARNESS_BASE_URL`, `HARNESS_API_KEY` and `GODOT`.
 
@@ -88,7 +108,7 @@ All of these can also be set with the environment variables `HARNESS_MODEL`, `HA
 
 ```mermaid
 flowchart LR
-    B[Game Brief] --> D{--grill?}
+    B[You describe a game] --> D{Design Interview?}
     D -- yes --> I[Design Interview] --> P[Design Proposal]
     D -- no --> P
     P --> W[Model writes GDScript]
@@ -100,7 +120,9 @@ flowchart LR
     F --> C[Change Request] --> W
 ```
 
-The model gets exactly five tools: `write_file`, `read_file`, `list_files`, `run_game` and `finish`.
+The model gets a small toolset: `create_game`, `open_game` and `list_games` to manage games, and
+`write_file`, `read_file`, `list_files`, `run_game`, `play_game` and `finish` to work on one.
+`project.godot` and `main.tscn` are owned by the harness, so the model can't corrupt them.
 `finish` is **rejected** unless the latest Run Check was clean, so the model can't call a broken game done.
 Keeping the toolset small helps open-weight models stay reliable.
 
@@ -112,8 +134,8 @@ and the model can always `read_file` to see the current state.
 The demo default is **Gemma 4 31B**, an open-weight model that's free on Ollama Cloud.
 
 ```bash
-python3 harness.py new "snake" --model qwen3.8:27b                       # local, fully offline
-python3 harness.py new "snake" --base-url https://openrouter.ai/api/v1 \
+python3 harness.py --model qwen3.8:27b                                   # local, fully offline
+python3 harness.py --base-url https://openrouter.ai/api/v1 \
     --api-key $OPENROUTER_API_KEY --model qwen/qwen3-coder                # hosted
 ```
 

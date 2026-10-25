@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""OpenGames Harness: drives any OpenAI-compatible model to design, build and iterate on Godot games.
+"""OpenGames Harness: a conversational CLI that designs, builds and iterates on Godot games with any model.
 
 Usage:
-    python3 harness.py new "a pong game" [--grill] [--name pong]
-    python3 harness.py edit pong
-    python3 harness.py play pong
+    python3 harness.py                          # start a conversation
+    python3 harness.py "a 3D marble maze"       # start with a first message
+    python3 harness.py --open pong              # continue working on a game in out/pong
 
 No dependencies beyond the Python standard library.
 """
@@ -20,19 +20,20 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 TEMPLATE = ROOT / "template"
 OUT = ROOT / "out"
+SESSIONS = OUT / ".sessions"
 DEFAULT_GODOT = ROOT / "tools" / "godot"
 INPUT_SIM = ROOT / "input_sim.gd"
 CAPTURE = ROOT / "capture.gd"
-HARNESS_DIR = ".harness"
 MAX_TOOL_OUTPUT = 4000
 KEEP_RECENT = 6  # messages at the end of the history that are never compacted
 
-# --- terminal trace -------------------------------------------------------
+# --- terminal -------------------------------------------------------------
 
 C = {"dim": "\033[2m", "bold": "\033[1m", "cyan": "\033[36m", "yellow": "\033[33m",
      "green": "\033[32m", "red": "\033[31m", "magenta": "\033[35m", "blue": "\033[34m",
@@ -43,72 +44,74 @@ def say(color, label, text=""):
     print(f"{C[color]}{C['bold']}{label}{C['reset']} {text}", flush=True)
 
 
-def ask(prompt="› "):
+def ask(prompt):
     try:
-        return input(f"{C['bold']}{prompt}{C['reset']}").strip()
+        return input(f"\n{C['bold']}{prompt}{C['reset']}").strip()
     except (EOFError, KeyboardInterrupt):
         print()
         return "/quit"
 
 
 class Trace:
-    """Appends every event of a session to <project>/.harness/trace.jsonl."""
+    """Appends every event of a Session to out/.sessions/<timestamp>.jsonl."""
 
-    def __init__(self, project_path: Path):
-        d = project_path / HARNESS_DIR
-        d.mkdir(exist_ok=True)
-        (d / ".gdignore").touch()  # keep Godot from importing harness files
-        self.file = d / "trace.jsonl"
+    def __init__(self):
+        SESSIONS.mkdir(parents=True, exist_ok=True)
+        self.file = SESSIONS / (datetime.now().strftime("%Y%m%d-%H%M%S") + ".jsonl")
 
     def log(self, event, **data):
         with self.file.open("a") as f:
             f.write(json.dumps({"t": round(time.time(), 3), "event": event, **data}) + "\n")
 
 
-# --- prompts --------------------------------------------------------------
+# --- prompt ---------------------------------------------------------------
 
-DESIGN_PROMPT = """You are a game designer interviewing a Player-Creator about a small game they want built
-in Godot 4. They may not know Godot. Your job is to reach a shared understanding of the design,
-then write a Design Proposal.
+SYSTEM_PROMPT = """You are OpenGames, a game designer and developer agent in a terminal conversation with a
+Player-Creator. Together you make small, complete games in Godot 4 (GDScript): any genre, 2D or 3D.
+The Player-Creator may not know Godot. Talk plainly and briefly.
 
-Interview in rounds. Each round, ask the 2-4 most important open questions whose answers you
-can't sensibly assume (genre and 2D/3D, core loop, controls, win/lose, scoring, look and feel,
-scope). Number each question and give your recommended answer, worded so "yes" accepts it:
+When you reply without calling a tool, your reply is shown to the Player-Creator and you wait for their answer.
+
+## New games
+{grill_rule}
+
+Design Interview format: ask 2-4 numbered questions per round about decisions you can't sensibly
+assume (genre and 2D/3D, core loop, controls, win/lose, scoring, look). Give a recommended answer
+for each, worded so "yes" accepts it:
 
 Q1 - <title>: <question>
   Recommended: <answer>
 
-Keep scope small enough for one person to build in an hour: no imported assets (visuals are
-built from simple shapes), no audio, no networking.
+A Design Proposal is Markdown with: Title, Pitch (one sentence), 2D or 3D, Core Loop, Controls,
+Win/Lose, Scoring and HUD, Look, Out of Scope. Keep scope buildable in an hour: no imported assets
+(visuals are simple shapes), no audio, no networking.
 
-When the important decisions are settled (usually after 1-3 rounds), or when the Player-Creator
-asks for it, write the Design Proposal inside <proposal></proposal> tags as Markdown with these
-sections: Title, Pitch (one sentence), 2D or 3D, Core Loop, Controls, Win/Lose, Scoring and HUD,
-Look, Out of Scope. If they ask for changes to a proposal, write a revised one in the same tags.
-"""
+Once the design is settled, call create_game with a short name and the design, then build it.
 
-BUILD_PROMPT = """You are a game developer agent that builds and maintains small, complete games in
-Godot 4 (GDScript). Any genre is allowed: 2D or 3D, action, puzzle, platformer, shooter, racing...
+## Existing games
+Use list_games / open_game when the Player-Creator refers to an existing game. Anything they ask
+for after a game exists is a Change Request: a new feature, a change, or a bug they found while
+playing. Read the files you need before editing them.
 
-You work in a Godot 4 project directory. A new project contains:
-- project.godot  (main scene is res://main.tscn; window 1152x648; Compatibility renderer)
-- main.tscn      (a plain Node named Main with script res://main.gd)
-- main.gd        (placeholder script that extends Node; replace it)
-- design.md      (the Design Proposal or Game Brief: the source of truth for what the game is)
-
-How to work on every task (a new game, a change, a new feature, or a bug report):
-1. Read the files you need, plan briefly, then write files with write_file
-   (always COMPLETE file contents). Split into several .gd files if it helps.
+## How to build or change a game
+1. Write files with write_file (always COMPLETE contents). Split into several .gd files if it helps.
 2. Call run_game to do a Run Check. It launches the game headless for ~30s of game time while
    simulating random key presses, mouse clicks and mouse movement, and returns errors.
 3. If there are errors, read them carefully, fix the files, and run_game again.
 4. After a CLEAN Run Check you may receive screenshots of the running game (a Visual Check).
    Compare them with design.md: a black or empty screen, a camera that misses the action,
-   unreadable HUD or missing elements are bugs. Fix them and run_game again; otherwise finish.
-5. Keep design.md current: when you add or change features or controls, update it.
-6. Call finish with a short summary of what you did and the controls.
+   unreadable HUD or missing elements are bugs. Fix them and run_game again.
+5. Keep design.md current: when features or controls change, update it.
+6. Call finish with a short summary of what you did and the controls. Do not stop before finish
+   while the game has unchecked edits.
 
-Rules for reliable games:
+A new game's project contains project.godot (main scene res://main.tscn, window 1152x648,
+Compatibility renderer), main.tscn (root node Main with script res://main.gd), main.gd (placeholder;
+replace it) and design.md. project.godot and main.tscn are managed by the harness and can't be
+edited: main.gd may extend Node, Node2D, Node3D or Control and the root node type follows it
+automatically. Put all game code in main.gd and other .gd files you create.
+
+## Rules for reliable games
 - Build the game in code from main.gd (create nodes in _ready with add_child).
   Avoid hand-writing .tscn files; if you must, use format=3 exactly.
 - No imported assets (no images, models or sounds). Build visuals from primitives:
@@ -129,51 +132,92 @@ Rules for reliable games:
   Do not invent custom input actions.
 - Use static typing where easy; indent with tabs. Always guard against null nodes.
 - Keep the scope small but fully playable: a goal, a score or win/lose state, and restart (R).
+
+Current state: {state}
 """
+
+GRILL_ON = ("Before building a new game, run a Design Interview (1-3 rounds), then show a Design Proposal "
+            "and ask the Player-Creator to accept it. Only call create_game after they accept. If they say "
+            "\"just build it\" or similar, skip straight to create_game using your recommendations.")
+GRILL_OFF = ("Design Interview is off: turn the Player-Creator's description into a Design Proposal yourself, "
+             "using sensible defaults, and call create_game straight away.")
 
 TOOLS = [
     {"type": "function", "function": {
+        "name": "create_game",
+        "description": "Create a new game project from the template and open it. Its design.md is set to `design`.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "Short folder name, e.g. marble-maze"},
+            "title": {"type": "string", "description": "Display title of the game"},
+            "design": {"type": "string", "description": "The accepted Design Proposal (Markdown)"}},
+            "required": ["name", "title", "design"]}}},
+    {"type": "function", "function": {
+        "name": "open_game",
+        "description": "Open an existing game so you can change it. Returns its files and design.md.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}}, "required": ["name"]}}},
+    {"type": "function", "function": {
+        "name": "list_games",
+        "description": "List the games that exist.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
         "name": "write_file",
-        "description": "Create or overwrite a file in the project with complete contents.",
+        "description": "Create or overwrite a file in the open game with complete contents.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "Path relative to the project root, e.g. main.gd"},
             "content": {"type": "string", "description": "Full file contents"}},
             "required": ["path", "content"]}}},
     {"type": "function", "function": {
         "name": "read_file",
-        "description": "Read a file from the project.",
+        "description": "Read a file from the open game.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"}}, "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "list_files",
-        "description": "List all files in the project.",
+        "description": "List all files in the open game.",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "run_game",
-        "description": "Run Check: launch the game headless for ~30s of game time while random keys, "
+        "description": "Run Check: launch the open game headless for ~30s of game time while random keys, "
                        "clicks and mouse movement are simulated, and return errors and output.",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
+        "name": "play_game",
+        "description": "Launch the open game in a window for the Player-Creator to play.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
         "name": "finish",
-        "description": "Declare the task done. Only allowed after a CLEAN Run Check with no later edits.",
+        "description": "Declare the current build or Change Request done. Only allowed after a CLEAN "
+                       "Run Check with no later edits.",
         "parameters": {"type": "object", "properties": {
             "summary": {"type": "string", "description": "What you did, and the game's controls"}},
             "required": ["summary"]}}},
 ]
+TOOL_NAMES = {t["function"]["name"] for t in TOOLS}
 
-# --- project and tools ----------------------------------------------------
+# --- projects -------------------------------------------------------------
 
-ERROR_PATTERN = re.compile(r"^\s*(SCRIPT ERROR|USER SCRIPT ERROR|ERROR|USER ERROR):")
+ERROR_PATTERN = re.compile(r"^\s*(SCRIPT ERROR|USER SCRIPT ERROR|ERROR|USER ERROR|Error):")
+# Files the harness owns: editing them is how models corrupt projects.
+PROTECTED = {"project.godot", "main.tscn"}
 # Engine shutdown noise, not caused by the game's logic.
 NOISE_PATTERN = re.compile(r"leaked at exit|in use at exit|still in use at exit|Pages in use exist at exit")
 
 
+def slugify(text):
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "game"
+
+
+def list_game_names():
+    return sorted(p.parent.name for p in OUT.glob("*/project.godot")) if OUT.exists() else []
+
+
 class Project:
-    def __init__(self, path: Path, godot: str, frames: int, visual: bool):
-        self.path = path
-        self.godot = godot
-        self.frames = frames
-        self.visual = visual
+    def __init__(self, path: Path, cfg):
+        self.path = path.resolve()
+        self.name = path.name
+        self.cfg = cfg
+        self.dirty = False                # edits that have not passed a Run Check yet
         self.clean_since_last_edit = False
         self.pending_shots: list[Path] = []
 
@@ -181,15 +225,17 @@ class Project:
         p = (self.path / rel.lstrip("/").removeprefix("res://")).resolve()
         if self.path not in p.parents and p != self.path:
             raise ValueError(f"path escapes project: {rel}")
-        if HARNESS_DIR in p.relative_to(self.path).parts:
-            raise ValueError(f"{HARNESS_DIR}/ is reserved for the harness")
         return p
 
     def write_file(self, path, content):
         p = self._resolve(path)
+        if str(p.relative_to(self.path)) in PROTECTED:
+            return (f"Error: {path} is managed by the harness and can't be edited. The root node in main.tscn "
+                    "automatically matches whatever main.gd extends (Node, Node2D, Node3D, Control...).")
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
-        self.clean_since_last_edit = False
+        if p.suffix != ".md":  # docs can't break the game, so they don't need a new Run Check
+            self.dirty, self.clean_since_last_edit = True, False
         return f"Wrote {path} ({len(content.splitlines())} lines)."
 
     def read_file(self, path):
@@ -198,7 +244,7 @@ class Project:
     def list_files(self):
         files = [str(f.relative_to(self.path)) for f in sorted(self.path.rglob("*"))
                  if f.is_file() and not f.name.endswith(".uid")
-                 and not {".godot", HARNESS_DIR} & set(f.relative_to(self.path).parts)]
+                 and not any(part.startswith(".") for part in f.relative_to(self.path).parts)]
         return "\n".join(files)
 
     def _launch(self, autoloads, args, timeout, env=None):
@@ -211,7 +257,7 @@ class Project:
         pg.write_text(original.replace("[autoload]\n", f"[autoload]\n\n{entries}", 1)
                       if "[autoload]" in original else original + f"\n[autoload]\n\n{entries}")
         try:
-            r = subprocess.run([self.godot, "--path", str(self.path), *args],
+            r = subprocess.run([self.cfg.godot, "--path", str(self.path), *args],
                                capture_output=True, text=True, timeout=timeout,
                                env={**os.environ, **(env or {})})
             return r.stdout + r.stderr
@@ -224,12 +270,20 @@ class Project:
                 (self.path / src.name).unlink(missing_ok=True)
                 (self.path / (src.name + ".uid")).unlink(missing_ok=True)
 
+    def sync_root(self):
+        """Make main.tscn's root node type match the class main.gd extends."""
+        script, scene = self.path / "main.gd", self.path / "main.tscn"
+        m = re.search(r"^extends\s+([A-Za-z0-9_]+)", script.read_text(), re.M) if script.exists() else None
+        if m and scene.exists():
+            scene.write_text(re.sub(r'(\[node name="Main" type=")[^"]+', rf"\g<1>{m.group(1)}", scene.read_text()))
+
     def run_game(self):
+        self.sync_root()
         # Import first so scripts and scenes are registered, then run a fixed number of
         # 60 fps frames (fast in headless, but simulated time advances normally).
-        subprocess.run([self.godot, "--headless", "--path", str(self.path), "--import"],
+        subprocess.run([self.cfg.godot, "--headless", "--path", str(self.path), "--import"],
                        capture_output=True, text=True, timeout=120)
-        out = self._launch([INPUT_SIM], ["--headless", "--fixed-fps", "60", "--quit-after", str(self.frames)], 90)
+        out = self._launch([INPUT_SIM], ["--headless", "--fixed-fps", "60", "--quit-after", str(self.cfg.frames)], 90)
         # Runtime errors in _process repeat every frame; keep each distinct line once.
         lines = list(dict.fromkeys(l for l in out.splitlines()
                                    if l.strip() and not l.startswith("Godot Engine v")
@@ -238,8 +292,8 @@ class Project:
         if errors or "TIMEOUT" in out:
             self.clean_since_last_edit = False
             return "ERRORS FOUND:\n" + "\n".join(lines)
-        self.clean_since_last_edit = True
-        if self.visual:
+        self.dirty, self.clean_since_last_edit = False, True
+        if self.cfg.visual:
             self.pending_shots = self.capture()
         return "CLEAN: game ran without errors.\nOutput:\n" + "\n".join(lines[-30:])
 
@@ -249,31 +303,40 @@ class Project:
         self._launch([INPUT_SIM, CAPTURE], ["--fixed-fps", "60"], 60, env={"HARNESS_SHOT_DIR": str(shot_dir)})
         return sorted(shot_dir.glob("shot_*.png"))
 
+    def play_game(self):
+        self.sync_root()
+        subprocess.Popen([self.cfg.godot, "--path", str(self.path)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return "Launched the game in a window."
+
     def finish(self, summary):
         if not self.clean_since_last_edit:
             return "REJECTED: run_game must report CLEAN after your last edit before you can finish."
         return "DONE"
 
-    def play(self):
-        subprocess.Popen([self.godot, "--path", str(self.path)],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def create_project(cfg, name, title, design):
+    out = OUT / slugify(name)
+    if out.exists():
+        raise ValueError(f"a game named {out.name} already exists; pick another name or open_game it")
+    shutil.copytree(TEMPLATE, out)
+    (out / "design.md").write_text(design.strip() + "\n")
+    pg = out / "project.godot"
+    pg.write_text(pg.read_text().replace('config/name="Generated Game"',
+                                         f'config/name="{title[:60].replace(chr(34), "")}"'))
+    return Project(out, cfg)
 
 
 # --- model client ---------------------------------------------------------
 
-def chat(cfg, messages, tools=None):
-    payload = {"model": cfg.model, "messages": messages}
-    if tools:
-        payload["tools"] = tools
+def chat(cfg, messages, tools):
+    payload = {"model": cfg.model, "messages": messages, "tools": tools}
     req = urllib.request.Request(cfg.base_url.rstrip("/") + "/chat/completions",
                                  data=json.dumps(payload).encode(), headers={
                                      "Content-Type": "application/json",
                                      "Authorization": f"Bearer {cfg.api_key}"})
-    try:
-        with urllib.request.urlopen(req, timeout=600) as r:
-            return json.load(r)["choices"][0]["message"]
-    except urllib.error.HTTPError as e:
-        sys.exit(f"Model API error {e.code}: {e.read().decode()[:500]}")
+    with urllib.request.urlopen(req, timeout=600) as r:
+        return json.load(r)["choices"][0]["message"]
 
 
 def compact(messages):
@@ -300,237 +363,239 @@ def compact(messages):
             m["content"] = m["content"][:300] + "\n<omitted: read earlier; use read_file again if needed>"
 
 
-# --- agent loop -----------------------------------------------------------
+# --- session --------------------------------------------------------------
 
-def run_agent(cfg, project, messages, trace):
-    """Run tool-calling steps until the model finishes cleanly. Returns True on success."""
-    for step in range(1, cfg.max_steps + 1):
-        print(f"{C['dim']}── step {step} ──{C['reset']}")
-        compact(messages)
-        msg = chat(cfg, messages, TOOLS)
-        messages.append({k: v for k, v in msg.items() if k in ("role", "content", "tool_calls")})
-        trace.log("model", content=msg.get("content"), tool_calls=msg.get("tool_calls"))
-        if msg.get("content"):
-            say("cyan", "MODEL", msg["content"].strip())
-        calls = msg.get("tool_calls") or []
-        if not calls:
-            messages.append({"role": "user", "content": "Continue by calling a tool. "
-                             "Use run_game to check the game, then finish when it is CLEAN."})
-            continue
-        for call in calls:
-            fn = call["function"]["name"]
+HELP = """Just talk: describe a new game, ask for changes, or report bugs you found while playing.
+  /games          list games            /open <name>   switch to a game
+  /play           play the open game    /files         list the open game's files
+  /grill on|off   Design Interview      /model <name>  switch model
+  /new            fresh conversation    /help          this help
+  /quit           exit"""
+
+
+class Session:
+    """One continuous conversation between the Player-Creator and the agent."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.project: Project | None = None
+        self.trace = Trace()
+        self.messages = [{"role": "system", "content": ""}]
+        self.trace.log("session", model=cfg.model, base_url=cfg.base_url)
+
+    # -- state shown to the model --
+
+    def _system(self):
+        state = (f'game "{self.project.name}" is open.' if self.project
+                 else "no game is open. Existing games: " + (", ".join(list_game_names()) or "none") + ".")
+        return SYSTEM_PROMPT.format(grill_rule=GRILL_ON if self.cfg.grill else GRILL_OFF, state=state)
+
+    def prompt(self):
+        return f"{self.project.name} › " if self.project else "› "
+
+    # -- tools that manage games; the rest go to the open Project --
+
+    def create_game(self, name, title, design):
+        self.project = create_project(self.cfg, name, title, design)
+        say("magenta", "CREATED", str(self.project.path))
+        return f"Created and opened {self.project.name}. Now build it."
+
+    def open_game(self, name):
+        path = OUT / slugify(name)
+        if not (path / "project.godot").exists():
+            return f"Error: no game named {name}. Games: {', '.join(list_game_names()) or 'none'}"
+        self.project = Project(path, self.cfg)
+        design = path / "design.md"
+        say("magenta", "OPENED", str(self.project.path))
+        return (f"Opened {self.project.name}.\nFiles:\n{self.project.list_files()}\n\ndesign.md:\n"
+                + (design.read_text() if design.exists() else "(none yet; write one)"))
+
+    def list_games(self):
+        return "\n".join(list_game_names()) or "No games yet."
+
+    def call_tool(self, fn, fargs):
+        if fn in ("create_game", "open_game", "list_games"):
+            return getattr(self, fn)(**fargs)
+        if self.project is None:
+            return "Error: no game is open. Use create_game or open_game first."
+        return getattr(self.project, fn)(**fargs)
+
+    # -- the agent turn --
+
+    def turn(self, user_text):
+        """Handle one Player-Creator message: run the agent until it replies or finishes."""
+        self.trace.log("user", content=user_text)
+        self.messages.append({"role": "user", "content": user_text})
+        nudged = False
+        for step in range(1, self.cfg.max_steps + 1):
+            self.messages[0]["content"] = self._system()
+            compact(self.messages)
+            print(f"{C['dim']}  thinking…{C['reset']}", end="\r", flush=True)
             try:
-                fargs = json.loads(call["function"].get("arguments") or "{}")
-            except json.JSONDecodeError:
-                fargs = None
-            shown = {k: (f"<{len(v.splitlines())} lines>" if k == "content" else v)
-                     for k, v in (fargs or {}).items()}
-            say("yellow", "TOOL", f"{fn}({json.dumps(shown)})")
-            if fargs is None:
-                result = "Error: arguments were not valid JSON."
-            elif fn not in {t["function"]["name"] for t in TOOLS}:
-                result = f"Error: unknown tool {fn}."
-            else:
-                try:
-                    result = getattr(project, fn)(**fargs)
-                except TypeError as e:
-                    result = f"Error: bad arguments for {fn}: {e}. Check the tool's required parameters."
-                except Exception as e:
-                    result = f"Error: {e}"
-            trace.log("tool_result", tool=fn, result=result)
-            if fn == "run_game":
-                say("green" if result.startswith("CLEAN") else "red", "RUN CHECK", result.splitlines()[0])
-                for l in result.splitlines()[1:12]:
-                    print(f"  {C['dim']}{l}{C['reset']}")
-            elif result.startswith(("Error", "REJECTED")):
-                say("red", "RESULT", result)
-            messages.append({"role": "tool", "tool_call_id": call.get("id", fn),
-                             "content": result[:MAX_TOOL_OUTPUT]})
-            if fn == "finish" and result == "DONE":
-                say("green", "FINISHED", fargs["summary"])
-                return True
-        if project.pending_shots:
-            shots, project.pending_shots = project.pending_shots, []
-            say("blue", "VISUAL CHECK", f"sending {len(shots)} screenshot(s) to the model")
-            trace.log("visual_check", screenshots=[str(s) for s in shots])
-            messages.append({"role": "user", "content": [
-                {"type": "text", "text": "Visual Check: screenshots of the running game after 1s and 4s "
-                 "with simulated input. Compare them with design.md. If something looks wrong, fix it and "
-                 "run_game again. If it looks right, call finish."},
-                *({"type": "image_url", "image_url": {
-                    "url": "data:image/png;base64," + base64.b64encode(s.read_bytes()).decode()}} for s in shots)]})
-    say("red", "STOPPED", f"hit max steps ({cfg.max_steps}) without a clean finish")
-    return False
+                msg = chat(self.cfg, self.messages, TOOLS)
+            except (urllib.error.URLError, TimeoutError) as e:
+                detail = e.read().decode()[:300] if isinstance(e, urllib.error.HTTPError) else str(e)
+                say("red", "MODEL ERROR", detail)
+                self.trace.log("model_error", detail=detail)
+                return
+            print(" " * 20, end="\r")
+            self.messages.append({k: v for k, v in msg.items() if k in ("role", "content", "tool_calls")})
+            self.trace.log("model", content=msg.get("content"), tool_calls=msg.get("tool_calls"))
+            calls = msg.get("tool_calls") or []
+            if not calls:
+                if self.project and self.project.dirty and not nudged:
+                    # The model stopped mid-build; push it to check and finish before handing back.
+                    nudged = True
+                    if msg.get("content"):
+                        say("cyan", "MODEL", msg["content"].strip())
+                    self.messages.append({"role": "user", "content": "You have edits that have not passed a "
+                                          "Run Check. Call run_game, fix any errors, then finish."})
+                    continue
+                print(f"\n{(msg.get('content') or '').strip()}")
+                return
+            if msg.get("content"):
+                say("cyan", "MODEL", msg["content"].strip())
+            for call in calls:
+                if self._run_call(call):
+                    return
+            if self.project and self.project.pending_shots:
+                self._visual_check()
+        say("red", "STOPPED", f"hit {self.cfg.max_steps} steps; say \"continue\" to keep going")
 
+    def _run_call(self, call):
+        """Execute one tool call. Returns True when the model finished its task."""
+        fn = call["function"]["name"]
+        try:
+            fargs = json.loads(call["function"].get("arguments") or "{}")
+        except json.JSONDecodeError:
+            fargs = None
+        shown = {k: (f"<{len(v.splitlines())} lines>" if k in ("content", "design") else v)
+                 for k, v in (fargs or {}).items()}
+        say("yellow", "TOOL", f"{fn}({json.dumps(shown)})")
+        if fargs is None:
+            result = "Error: arguments were not valid JSON."
+        elif fn not in TOOL_NAMES:
+            result = f"Error: unknown tool {fn}."
+        else:
+            try:
+                result = self.call_tool(fn, fargs)
+            except TypeError as e:
+                result = f"Error: bad arguments for {fn}: {e}. Check the tool's required parameters."
+            except Exception as e:
+                result = f"Error: {e}"
+        self.trace.log("tool_result", tool=fn, result=result)
+        if fn == "run_game":
+            say("green" if result.startswith("CLEAN") else "red", "RUN CHECK", result.splitlines()[0])
+            for l in result.splitlines()[1:12]:
+                print(f"  {C['dim']}{l}{C['reset']}")
+        elif result.startswith(("Error", "REJECTED")):
+            say("red", "RESULT", result)
+        self.messages.append({"role": "tool", "tool_call_id": call.get("id", fn),
+                              "content": result[:MAX_TOOL_OUTPUT]})
+        if fn == "finish" and result == "DONE":
+            say("green", "FINISHED", fargs["summary"])
+            print(f"{C['dim']}Type /play to play it, or ask for changes.{C['reset']}")
+            return True
+        return False
 
-# --- design interview -----------------------------------------------------
+    def _visual_check(self):
+        shots, self.project.pending_shots = self.project.pending_shots, []
+        say("blue", "VISUAL CHECK", f"sending {len(shots)} screenshot(s) to the model")
+        self.trace.log("visual_check", screenshots=[str(s) for s in shots])
+        self.messages.append({"role": "user", "content": [
+            {"type": "text", "text": "Visual Check: screenshots of the running game after 1s and 4s "
+             "with simulated input. Compare them with design.md. If something looks wrong, fix it and "
+             "run_game again. If it looks right, call finish."},
+            *({"type": "image_url", "image_url": {
+                "url": "data:image/png;base64," + base64.b64encode(s.read_bytes()).decode()}} for s in shots)]})
 
-def design_interview(cfg, brief, trace):
-    """Grill the Player-Creator about the design until they accept a Design Proposal."""
-    say("magenta", "DESIGN", "Answer the questions (\"yes\" accepts the recommendations). "
-        "Type /propose to skip to a proposal, /quit to abort.")
-    messages = [{"role": "system", "content": DESIGN_PROMPT},
-                {"role": "user", "content": f"Game Brief: {brief}"}]
-    while True:
-        msg = chat(cfg, messages)
-        content = msg.get("content") or ""
-        messages.append({"role": "assistant", "content": content})
-        trace.log("design_model", content=content)
-        proposal = re.search(r"<proposal>(.*?)</proposal>", content, re.S)
-        if proposal:
-            print(f"\n{proposal.group(1).strip()}\n")
-            reply = ask("Accept this design? [y = build it / or type changes] › ")
-            while reply.startswith("/") and reply != "/quit":
-                reply = ask("Type y to build it, describe changes, or /quit › ")
-            trace.log("design_user", content=reply)
-            if reply == "/quit":
-                return None
-            if reply.lower() in ("y", "yes", "ok", "accept"):
-                return proposal.group(1).strip()
-            messages.append({"role": "user", "content": f"Revise the proposal: {reply}"})
-            continue
-        say("cyan", "DESIGNER", content.strip())
-        reply = ask()
-        trace.log("design_user", content=reply)
-        if reply == "/quit":
-            return None
-        if reply == "/propose":
-            reply = "Write the Design Proposal now, using your recommendations for anything still open."
-        messages.append({"role": "user", "content": reply})
+    # -- slash commands --
 
-
-# --- sessions -------------------------------------------------------------
-
-HELP = """Type a Change Request: a new feature, a change, or a bug you found while playing.
-  /play   launch the game in a window
-  /files  list project files
-  /help   show this help
-  /quit   exit (run `python3 harness.py edit <name>` to continue later)"""
-
-
-def iterate(cfg, project, messages, trace, name):
-    """Interactive loop: each Change Request is built, Run Checked and finished like a new game."""
-    say("magenta", "ITERATE", "The game is ready. " + HELP.splitlines()[0])
-    print(f"{C['dim']}{HELP}{C['reset']}")
-    while True:
-        req = ask()
-        if not req:
-            continue
-        if req == "/quit":
-            print(f"Continue later with: python3 harness.py edit {name}")
-            return
-        if req == "/play":
-            project.play()
-            continue
-        if req == "/files":
-            print(project.list_files())
-            continue
-        if req == "/help":
+    def command(self, line):
+        """Handle a /command. Returns False when the session should end."""
+        cmd, _, arg = line.partition(" ")
+        arg = arg.strip()
+        if cmd == "/quit":
+            return False
+        elif cmd == "/help":
             print(HELP)
-            continue
-        trace.log("change_request", content=req)
-        messages.append({"role": "user", "content":
-                         f"Change Request from the Player-Creator: {req}\n"
-                         "It may be a new feature, a change, or a bug they found while playing. "
-                         "Make it, keep design.md current, Run Check, then finish."})
-        project.clean_since_last_edit = False
-        run_agent(cfg, project, messages, trace)
+        elif cmd == "/games":
+            print(self.list_games())
+        elif cmd == "/open":
+            if not arg:
+                print("Usage: /open <name>")
+            else:
+                result = self.open_game(arg)
+                if result.startswith("Error"):
+                    say("red", "ERROR", result)
+                else:
+                    # Tell the model what happened so the conversation stays coherent.
+                    self.messages.append({"role": "user", "content": f"[I opened a game]\n{result}"})
+                    self.messages.append({"role": "assistant", "content": f"{self.project.name} is open."})
+        elif cmd in ("/play", "/files"):
+            if not self.project:
+                print("No game is open. Use /open <name> or describe a new game.")
+            elif cmd == "/play":
+                self.project.play_game()
+            else:
+                print(self.project.list_files())
+        elif cmd == "/grill":
+            if arg in ("on", "off"):
+                self.cfg.grill = arg == "on"
+            print(f"Design Interview is {'on' if self.cfg.grill else 'off'}.")
+        elif cmd == "/model":
+            if arg:
+                self.cfg.model = arg
+            print(f"Model: {self.cfg.model}")
+        elif cmd == "/new":
+            self.project = None
+            self.messages = [{"role": "system", "content": ""}]
+            print("Started a fresh conversation.")
+        else:
+            print(f"Unknown command {cmd}. /help lists commands.")
+        self.trace.log("command", line=line)
+        return True
 
-
-def slugify(text):
-    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "game"
-
-
-def cmd_new(cfg):
-    out = OUT / (cfg.name or slugify(cfg.brief))
-    if out.exists():
-        if ask(f"{out} exists. Overwrite? [y/N] › ").lower() not in ("y", "yes"):
-            return
-        shutil.rmtree(out)
-    shutil.copytree(TEMPLATE, out)
-    trace = Trace(out)
-    trace.log("session", mode="new", model=cfg.model, brief=cfg.brief, grill=cfg.grill)
-    say("magenta", "HARNESS", f"model={cfg.model} base_url={cfg.base_url}")
-    say("magenta", "PROJECT", str(out))
-    say("magenta", "BRIEF", cfg.brief)
-
-    design = cfg.brief
-    if cfg.grill:
-        design = design_interview(cfg, cfg.brief, trace)
-        if design is None:
-            say("red", "ABORTED", "no design accepted")
-            return
-        trace.log("design_accepted", proposal=design)
-    (out / "design.md").write_text(design + "\n")
-    title = re.search(r"^#+\s*(?:Title:?\s*)?(.+)$", design, re.M)
-    pg = out / "project.godot"
-    pg.write_text(pg.read_text().replace('config/name="Generated Game"',
-                                         f'config/name="{(title.group(1) if title else cfg.brief)[:60].replace(chr(34), "")}"'))
-
-    project = Project(out.resolve(), cfg.godot, cfg.frames, cfg.visual)
-    messages = [{"role": "system", "content": BUILD_PROMPT},
-                {"role": "user", "content": f"Build this game. design.md contains:\n\n{design}"}]
-    run_agent(cfg, project, messages, trace)
-    if cfg.interactive:
-        iterate(cfg, project, messages, trace, out.name)
-
-
-def open_existing(cfg):
-    out = OUT / cfg.name
-    if not (out / "project.godot").exists():
-        sys.exit(f"No game at {out}")
-    return out, Project(out.resolve(), cfg.godot, cfg.frames, cfg.visual)
-
-
-def cmd_edit(cfg):
-    out, project = open_existing(cfg)
-    trace = Trace(out)
-    trace.log("session", mode="edit", model=cfg.model)
-    say("magenta", "HARNESS", f"model={cfg.model} base_url={cfg.base_url}")
-    say("magenta", "PROJECT", str(out))
-    design = (out / "design.md").read_text() if (out / "design.md").exists() else "(no design.md yet)"
-    messages = [{"role": "system", "content": BUILD_PROMPT},
-                {"role": "user", "content": f"You are continuing work on an existing game.\n\n"
-                 f"Files:\n{project.list_files()}\n\ndesign.md:\n{design}\n\n"
-                 "Wait for Change Requests; read files before editing them."},
-                {"role": "assistant", "content": "Understood. Ready for Change Requests."}]
-    iterate(cfg, project, messages, trace, out.name)
-
-
-def cmd_play(cfg):
-    _, project = open_existing(cfg)
-    project.play()
+    def run(self, first_message=None):
+        print(f"{C['bold']}{C['magenta']}OpenGames{C['reset']}  "
+              f"{C['dim']}model {self.cfg.model} · Design Interview {'on' if self.cfg.grill else 'off'}"
+              f" · {len(list_game_names())} game(s) in out/{C['reset']}")
+        print(f"{C['dim']}{HELP}{C['reset']}")
+        if not first_message:
+            print("\nWhat game do you want to make?")
+        while True:
+            line = first_message or ask(self.prompt())
+            first_message = None
+            if not line:
+                continue
+            if line.startswith("/"):
+                if not self.command(line):
+                    print(f"{C['dim']}Session saved to {self.trace.file}{C['reset']}")
+                    return
+                continue
+            self.turn(line)
 
 
 def main():
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--model", default=os.environ.get("HARNESS_MODEL", "gemma4:31b-cloud"))
-    common.add_argument("--base-url", default=os.environ.get("HARNESS_BASE_URL", "http://localhost:11434/v1"))
-    common.add_argument("--api-key", default=os.environ.get("HARNESS_API_KEY", "ollama"))
-    common.add_argument("--godot", default=os.environ.get("GODOT", str(DEFAULT_GODOT)))
-    common.add_argument("--max-steps", type=int, default=40, help="Max agent steps per task")
-    common.add_argument("--frames", type=int, default=1800, help="Frames (at 60 fps) to run during a Run Check")
-    common.add_argument("--no-visual", dest="visual", action="store_false",
-                        help="Skip the Visual Check (needs a display and a vision-capable model)")
-
-    ap = argparse.ArgumentParser(description="OpenGames: design, build and iterate on Godot games with any model.")
-    sub = ap.add_subparsers(dest="command", required=True)
-    p_new = sub.add_parser("new", parents=[common], help="Create a new game from a Game Brief")
-    p_new.add_argument("brief", help="Game Brief: plain-language description of the game")
-    p_new.add_argument("--name", help="Output folder name under out/ (default: from brief)")
-    p_new.add_argument("--grill", action="store_true", help="Interview me about the design before building")
-    p_new.add_argument("--no-interactive", dest="interactive", action="store_false",
-                       help="Exit after the build instead of taking Change Requests")
-    p_new.set_defaults(func=cmd_new)
-    p_edit = sub.add_parser("edit", parents=[common], help="Iterate on an existing game with Change Requests")
-    p_edit.add_argument("name", help="Folder name under out/")
-    p_edit.set_defaults(func=cmd_edit)
-    p_play = sub.add_parser("play", parents=[common], help="Launch a game in a window")
-    p_play.add_argument("name", help="Folder name under out/")
-    p_play.set_defaults(func=cmd_play)
-
+    ap = argparse.ArgumentParser(description="OpenGames: a conversational CLI that designs, builds and "
+                                             "iterates on Godot games with any model.")
+    ap.add_argument("message", nargs="?", help="Optional first message, e.g. \"a 3D marble maze\"")
+    ap.add_argument("--open", metavar="NAME", help="Start with an existing game from out/ open")
+    ap.add_argument("--model", default=os.environ.get("HARNESS_MODEL", "gemma4:31b-cloud"))
+    ap.add_argument("--base-url", default=os.environ.get("HARNESS_BASE_URL", "http://localhost:11434/v1"))
+    ap.add_argument("--api-key", default=os.environ.get("HARNESS_API_KEY", "ollama"))
+    ap.add_argument("--godot", default=os.environ.get("GODOT", str(DEFAULT_GODOT)))
+    ap.add_argument("--max-steps", type=int, default=40, help="Max agent steps per message")
+    ap.add_argument("--frames", type=int, default=1800, help="Frames (at 60 fps) to run during a Run Check")
+    ap.add_argument("--no-grill", dest="grill", action="store_false", help="Skip the Design Interview")
+    ap.add_argument("--no-visual", dest="visual", action="store_false",
+                    help="Skip the Visual Check (needs a display and a vision-capable model)")
     cfg = ap.parse_args()
-    cfg.func(cfg)
+
+    session = Session(cfg)
+    if cfg.open:
+        session.command(f"/open {cfg.open}")
+    session.run(cfg.message)
 
 
 if __name__ == "__main__":
