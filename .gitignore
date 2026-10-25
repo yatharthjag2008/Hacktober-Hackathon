@@ -15,3 +15,5 @@ __pycache__/
 Thumbs.db
 .vscode/
 .idea/
+# Local issue tracker and specs (see docs/agents/issue-tracker.md)
+.scratch/
