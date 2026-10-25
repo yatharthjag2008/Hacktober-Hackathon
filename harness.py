@@ -5,6 +5,7 @@ Usage:
     python3 harness.py                          # start a conversation
     python3 harness.py "a 3D marble maze"       # start with a first message
     python3 harness.py --open pong              # continue working on a game in out/pong
+    python3 harness.py --out-dir /tmp/games     # keep games and traces somewhere else
 
 No dependencies beyond the Python standard library.
 """
@@ -25,8 +26,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 TEMPLATE = ROOT / "template"
-OUT = ROOT / "out"
-SESSIONS = OUT / ".sessions"
+DEFAULT_OUT = ROOT / "out"
 DEFAULT_GODOT = ROOT / "tools" / "godot"
 INPUT_SIM = ROOT / "input_sim.gd"
 CAPTURE = ROOT / "capture.gd"
@@ -53,11 +53,12 @@ def ask(prompt):
 
 
 class Trace:
-    """Appends every event of a Session to out/.sessions/<timestamp>.jsonl."""
+    """Appends every event of a Session to <out>/.sessions/<timestamp>.jsonl."""
 
-    def __init__(self):
-        SESSIONS.mkdir(parents=True, exist_ok=True)
-        self.file = SESSIONS / (datetime.now().strftime("%Y%m%d-%H%M%S") + ".jsonl")
+    def __init__(self, out):
+        sessions = out / ".sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        self.file = sessions / (datetime.now().strftime("%Y%m%d-%H%M%S") + ".jsonl")
 
     def log(self, event, **data):
         with self.file.open("a") as f:
@@ -208,8 +209,8 @@ def slugify(text):
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "game"
 
 
-def list_game_names():
-    return sorted(p.parent.name for p in OUT.glob("*/project.godot")) if OUT.exists() else []
+def list_game_names(out):
+    return sorted(p.parent.name for p in out.glob("*/project.godot")) if out.exists() else []
 
 
 class Project:
@@ -316,7 +317,7 @@ class Project:
 
 
 def create_project(cfg, name, title, design):
-    out = OUT / slugify(name)
+    out = cfg.out / slugify(name)
     if out.exists():
         raise ValueError(f"a game named {out.name} already exists; pick another name or open_game it")
     shutil.copytree(TEMPLATE, out)
@@ -379,7 +380,7 @@ class Session:
     def __init__(self, cfg):
         self.cfg = cfg
         self.project: Project | None = None
-        self.trace = Trace()
+        self.trace = Trace(cfg.out)
         self.messages = [{"role": "system", "content": ""}]
         self.trace.log("session", model=cfg.model, base_url=cfg.base_url)
 
@@ -387,7 +388,7 @@ class Session:
 
     def _system(self):
         state = (f'game "{self.project.name}" is open.' if self.project
-                 else "no game is open. Existing games: " + (", ".join(list_game_names()) or "none") + ".")
+                 else "no game is open. Existing games: " + (", ".join(list_game_names(self.cfg.out)) or "none") + ".")
         return SYSTEM_PROMPT.format(grill_rule=GRILL_ON if self.cfg.grill else GRILL_OFF, state=state)
 
     def prompt(self):
@@ -401,9 +402,9 @@ class Session:
         return f"Created and opened {self.project.name}. Now build it."
 
     def open_game(self, name):
-        path = OUT / slugify(name)
+        path = self.cfg.out / slugify(name)
         if not (path / "project.godot").exists():
-            return f"Error: no game named {name}. Games: {', '.join(list_game_names()) or 'none'}"
+            return f"Error: no game named {name}. Games: {', '.join(list_game_names(self.cfg.out)) or 'none'}"
         self.project = Project(path, self.cfg)
         design = path / "design.md"
         say("magenta", "OPENED", str(self.project.path))
@@ -411,7 +412,7 @@ class Session:
                 + (design.read_text() if design.exists() else "(none yet; write one)"))
 
     def list_games(self):
-        return "\n".join(list_game_names()) or "No games yet."
+        return "\n".join(list_game_names(self.cfg.out)) or "No games yet."
 
     def call_tool(self, fn, fargs):
         if fn in ("create_game", "open_game", "list_games"):
@@ -559,7 +560,7 @@ class Session:
     def run(self, first_message=None):
         print(f"{C['bold']}{C['magenta']}OpenGames{C['reset']}  "
               f"{C['dim']}model {self.cfg.model} · Design Interview {'on' if self.cfg.grill else 'off'}"
-              f" · {len(list_game_names())} game(s) in out/{C['reset']}")
+              f" · {len(list_game_names(self.cfg.out))} game(s) in {self.cfg.out}{C['reset']}")
         print(f"{C['dim']}{HELP}{C['reset']}")
         if not first_message:
             print("\nWhat game do you want to make?")
@@ -580,7 +581,7 @@ def main():
     ap = argparse.ArgumentParser(description="OpenGames: a conversational CLI that designs, builds and "
                                              "iterates on Godot games with any model.")
     ap.add_argument("message", nargs="?", help="Optional first message, e.g. \"a 3D marble maze\"")
-    ap.add_argument("--open", metavar="NAME", help="Start with an existing game from out/ open")
+    ap.add_argument("--open", metavar="NAME", help="Start with an existing game from the output directory open")
     ap.add_argument("--model", default=os.environ.get("HARNESS_MODEL", "gemma4:31b-cloud"))
     ap.add_argument("--base-url", default=os.environ.get("HARNESS_BASE_URL", "http://localhost:11434/v1"))
     ap.add_argument("--api-key", default=os.environ.get("HARNESS_API_KEY", "ollama"))
@@ -590,7 +591,10 @@ def main():
     ap.add_argument("--no-grill", dest="grill", action="store_false", help="Skip the Design Interview")
     ap.add_argument("--no-visual", dest="visual", action="store_false",
                     help="Skip the Visual Check (needs a display and a vision-capable model)")
+    ap.add_argument("--out-dir", dest="out", type=Path, default=os.environ.get("HARNESS_OUT_DIR", DEFAULT_OUT),
+                    help="Where games and Session traces are written (default: out/)")
     cfg = ap.parse_args()
+    cfg.out = Path(cfg.out).resolve()
 
     session = Session(cfg)
     if cfg.open:
