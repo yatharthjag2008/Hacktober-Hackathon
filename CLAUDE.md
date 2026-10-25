@@ -2,7 +2,7 @@
 
 ### Issue tracker
 
-Issues live as local markdown files under `.scratch/<feature>/`. See `docs/agents/issue-tracker.md`.
+Agent specs and issues are local markdown files under `.scratch/<feature>/`. That folder is gitignored, so it exists only in your own clone; create it when you need it, and never commit it. Public bug reports and feature requests go to GitHub Issues. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

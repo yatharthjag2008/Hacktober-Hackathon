@@ -1,6 +1,8 @@
 # Issue tracker: Local Markdown
 
-Issues and specs for this repo live as markdown files in `.scratch/`.
+Agent specs and issues for this repo are markdown files in `.scratch/`.
+
+`.scratch/` is **gitignored and local to each clone**: it is a working area for agents, not part of the published repo. In a fresh clone it won't exist; create it when a skill needs it, and never commit it. Public bug reports and feature requests belong in [GitHub Issues](https://github.com/yatharthjag2008/OpenGames/issues).
 
 ## Conventions
 
@@ -12,11 +14,11 @@ Issues and specs for this repo live as markdown files in `.scratch/`.
 
 ## When a skill says "publish to the issue tracker"
 
-Create a new file under `.scratch/<feature-slug>/` (creating the directory if needed).
+Create a new file under `.scratch/<feature-slug>/` (creating the directory if needed). It stays local; don't commit it.
 
 ## When a skill says "fetch the relevant ticket"
 
-Read the file at the referenced path. The user will normally pass the path or the issue number directly.
+Read the file at the referenced path. The user will normally pass the path or the issue number directly. If `.scratch/` doesn't exist in this clone, the ticket isn't available locally; ask the user for it.
 
 ## Wayfinding operations
 
