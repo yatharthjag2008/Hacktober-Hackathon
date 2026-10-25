@@ -1,4 +1,17 @@
+# Generated games and session traces
 out/
+# Local Godot binary
 tools/
-__pycache__/
+# Godot editor cache (also created when opening examples/ in the editor)
 .godot/
+# Per-game traces from older harness versions
+.harness/
+# Python
+__pycache__/
+# Secrets, e.g. HARNESS_API_KEY for hosted endpoints
+.env
+# OS / editor clutter
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
