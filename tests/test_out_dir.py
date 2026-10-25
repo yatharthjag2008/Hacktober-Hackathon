@@ -31,10 +31,10 @@ class OutputDirectory(unittest.TestCase):
     def test_env_var_sets_output_directory(self):
         out = self.tmp / "games"
         quit_session(HARNESS, {"HARNESS_OUT_DIR": str(out)})
-        self.assertEqual([e["event"] for e in trace_lines(out)], ["session"])
+        self.assertEqual([e["event"] for e in trace_lines(out)], ["session", "command"])  # /quit is traced
 
     def test_defaults_to_out_next_to_harness(self):
         harness = self.tmp / "harness.py"  # a copy, so the real out/ is never touched
         shutil.copy(HARNESS, harness)
         quit_session(harness, {})
-        self.assertEqual([e["event"] for e in trace_lines(self.tmp / "out")], ["session"])
+        self.assertEqual([e["event"] for e in trace_lines(self.tmp / "out")], ["session", "command"])  # /quit is traced

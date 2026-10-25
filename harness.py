@@ -514,6 +514,7 @@ class Session:
 
     def command(self, line):
         """Handle a /command. Returns False when the session should end."""
+        self.trace.log("command", line=line)
         cmd, _, arg = line.partition(" ")
         arg = arg.strip()
         if cmd == "/quit":
@@ -554,7 +555,6 @@ class Session:
             print("Started a fresh conversation.")
         else:
             print(f"Unknown command {cmd}. /help lists commands.")
-        self.trace.log("command", line=line)
         return True
 
     def run(self, first_message=None):
