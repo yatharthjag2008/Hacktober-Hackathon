@@ -1,17 +1,13 @@
-from support import HarnessTest, reply, tool_call
-
-DESIGN = "# Box\n\nPitch: a box on screen.\n"
-MAIN_GD = 'extends Node2D\n\nfunc _ready() -> void:\n\tprint("box ready")\n'
+from support import DESIGN, MAIN_GD, HarnessTest, box_game, tool_call
 
 
 class BuildNewGame(HarnessTest):
     def test_create_write_check_finish(self):
-        r = self.run_harness([
-            tool_call("create_game", name="box", title="Box", design=DESIGN),
+        r = self.run_harness(box_game(
             tool_call("write_file", path="main.gd", content=MAIN_GD),
             tool_call("run_game"),
             tool_call("finish", summary="A box. No controls."),
-        ], ["make a box game"], "--no-grill")
+        ), ["make a box game"], "--no-grill")
 
         game = self.out_dir / "box"
         self.assertTrue((game / "project.godot").exists())

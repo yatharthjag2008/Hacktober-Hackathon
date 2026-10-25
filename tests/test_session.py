@@ -1,11 +1,10 @@
 """Session behavior through the CLI seam: gates, nudges, slash commands, errors, limits, compaction."""
 from unittest import mock
 
-import support
-from support import HarnessTest, calls, call, reply, tool_call
+import socket
 
-DESIGN = "# Box\n\nPitch: a box on screen.\n"
-MAIN_GD = 'extends Node2D\n\nfunc _ready() -> void:\n\tprint("box ready")\n'
+import support
+from support import DESIGN, DROP, MAIN_GD, HarnessTest, box_game, reply, tool_call
 
 
 def last_message(request):
@@ -31,8 +30,7 @@ class DesignInterview(HarnessTest):
             r = self.run_harness([
                 reply("Q1 - Look: 2D?\n  Recommended: 2D"),
                 reply("Design Proposal:\n" + DESIGN + "\nAccept?"),
-                tool_call("create_game", name="box", title="Box", design=DESIGN),
-                reply("Created."),
+                *box_game(reply("Created.")),
             ], ["make a box game", "yes", "yes"])
 
         self.assertIn("run a Design Interview", r.requests[0]["messages"][0]["content"])
@@ -44,14 +42,13 @@ class DesignInterview(HarnessTest):
 
 class FinishGate(HarnessTest):
     def test_finish_needs_a_clean_check_after_the_last_game_edit_but_not_after_a_doc_edit(self):
-        r = self.run_harness([
-            tool_call("create_game", name="box", title="Box", design=DESIGN),
+        r = self.run_harness(box_game(
             tool_call("write_file", path="main.gd", content=MAIN_GD),
             tool_call("finish", summary="too early"),
             tool_call("run_game"),
             tool_call("write_file", path="design.md", content=DESIGN + "\nControls: none.\n"),
             tool_call("finish", summary="A box."),
-        ], ["make a box game"], "--no-grill")
+        ), ["make a box game"], "--no-grill")
 
         results = [(e["tool"], e["result"]) for e in r.events("tool_result")]
         self.assertEqual(results[2][0], "finish")
@@ -64,13 +61,12 @@ class FinishGate(HarnessTest):
 
 class UncheckedEditNudge(HarnessTest):
     def test_a_text_reply_with_unchecked_edits_gets_exactly_one_nudge(self):
-        r = self.run_harness([
-            tool_call("create_game", name="box", title="Box", design=DESIGN),
+        r = self.run_harness(box_game(
             tool_call("write_file", path="main.gd", content=MAIN_GD),
             reply("All done!"),
             reply("Still not checked, sorry."),
             reply("Never sent."),
-        ], ["make a box game"], "--no-grill")
+        ), ["make a box game"], "--no-grill")
 
         self.assertEqual(len(r.requests), 4)  # one nudge, then control went back to stdin (EOF)
         nudge = last_message(r.requests[3])
@@ -89,10 +85,10 @@ class SlashCommands(HarnessTest):
     def test_games_lists_existing_games(self):
         self.make_game("pong")
         self.make_game("snake")
-        r = self.run_harness([], ["/games", "/quit"])  # EOF quits
+        r = self.run_harness([], ["/games", "/quit"])
         self.assertIn("pong\nsnake", r.stdout)
         self.assertEqual(r.requests, [])
-        self.assertEqual([e["line"] for e in r.events("command")], ["/games", "/quit"])  # EOF quits
+        self.assertEqual([e["line"] for e in r.events("command")], ["/games", "/quit"])
 
     def test_open_switches_game_and_tells_the_model(self):
         self.make_game("pong", "main.gd", "design.md")
@@ -145,6 +141,25 @@ class ModelErrors(HarnessTest):
         self.assertEqual(last_message(r.requests[1])["content"], "second")
         self.assertIn("Back online.", r.stdout)
 
+    def test_a_dropped_connection_is_reported_and_the_session_keeps_going(self):
+        r = self.run_harness([DROP, reply("Back online.")], ["first", "second"])
+        self.assertIn("MODEL ERROR", r.stdout)
+        self.assertEqual(len(r.events("model_error")), 1, r.stdout)
+        self.assertEqual(len(r.requests), 2)
+        self.assertEqual(last_message(r.requests[1])["content"], "second")
+        self.assertIn("Back online.", r.stdout)
+        self.assertEqual(r.returncode, 0)
+
+    def test_an_unreachable_model_is_reported_and_the_session_keeps_going(self):
+        with socket.socket() as s:  # a port nothing listens on
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        r = self.run_harness([], ["first", "second"], "--base-url", f"http://127.0.0.1:{port}/v1")
+        self.assertIn("MODEL ERROR", r.stdout)
+        self.assertEqual([e["content"] for e in r.events("user")], ["first", "second"])
+        self.assertEqual(len(r.events("model_error")), 2, r.stdout)
+        self.assertEqual(r.returncode, 0)
+
 
 class StepLimit(HarnessTest):
     def test_a_model_that_never_finishes_stops_at_max_steps(self):
@@ -159,19 +174,29 @@ class HistoryCompaction(HarnessTest):
     def test_old_write_file_contents_drop_out_of_later_requests(self):
         marker = "UNIQUE_MARKER_42"
         content = MAIN_GD + f"# {marker}\n"
-        r = self.run_harness([
-            tool_call("create_game", name="box", title="Box", design=DESIGN),
+        r = self.run_harness(box_game(
             tool_call("write_file", path="main.gd", content=content),
             *[tool_call("list_files") for _ in range(6)],
             reply("Waiting."),
-        ], ["make a box game"], "--no-grill")
+        ), ["make a box game"], "--no-grill")
 
         self.assertEqual((self.out_dir / "box" / "main.gd").read_text(), content)
         self.assertIn(marker, str(r.requests[2]))  # sent right after it was written
         self.assertNotIn(marker, str(r.requests[-1]))
         self.assertIn("<omitted", str(r.requests[-1]))
 
+    def test_long_old_file_reads_are_truncated_in_later_requests(self):
+        marker = "UNIQUE_MARKER_43"
+        notes = "# Notes\n\n" + "filler line\n" * 200 + marker + "\n"  # well past the truncation point
+        r = self.run_harness(box_game(
+            tool_call("write_file", path="notes.md", content=notes),
+            tool_call("read_file", path="notes.md"),
+            *[tool_call("list_files") for _ in range(6)],
+            reply("Waiting."),
+        ), ["make a box game"], "--no-grill")
 
-if __name__ == "__main__":
-    import unittest
-    unittest.main()
+        self.assertEqual(r.results("read_file"), [notes])
+        read_result = [m for m in r.requests[3]["messages"] if m["role"] == "tool"][-1]["content"]
+        self.assertEqual(read_result, notes)  # sent in full right after it was read
+        self.assertNotIn(marker, str(r.requests[-1]))
+        self.assertIn("<omitted: read earlier", str(r.requests[-1]))
