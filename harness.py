@@ -223,7 +223,7 @@ class Project:
         self.pending_shots: list[Path] = []
 
     def _resolve(self, rel: str) -> Path:
-        p = (self.path / rel.lstrip("/").removeprefix("res://")).resolve()
+        p = (self.path / rel.removeprefix("res://")).resolve()  # an absolute path replaces self.path
         if self.path not in p.parents and p != self.path:
             raise ValueError(f"path escapes project: {rel}")
         return p
